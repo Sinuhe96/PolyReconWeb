@@ -1,0 +1,17 @@
+*.exe
+*.dbg
+*.lps
+GeneticPicture.res
+link*.res
+*.o
+*.ppu
+*.obj
+backup/
+lib/
+ppas.bat
+*.res
+.vscode/launch.json
+.vscode/settings.json
+.vscode/tasks.json
+*.png
+*.jpg
