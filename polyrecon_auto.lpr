@@ -45,6 +45,24 @@ type
 
   // ── Utils ────────────────────────────────────────────────────────────────────
 
+  // Expand ~ to user's home directory (Windows)
+  function ExpandTilde(const Path: string): string;
+  var
+    HomeDir: string;
+  begin
+    if (Length(Path) > 0) and (Path[1] = '~') then
+    begin
+      // Get Windows USERPROFILE environment variable
+      HomeDir := GetEnvironmentVariable('USERPROFILE');
+      if HomeDir <> '' then
+        Result := HomeDir + Copy(Path, 2, MaxInt)
+      else
+        Result := Path  // Fallback if env var not found
+    end
+    else
+      Result := Path;
+  end;
+
   // Box-Muller transform for standard normal distribution
   function Randn: double;
   var
@@ -667,8 +685,8 @@ type
         begin
           CanvasBmp := TBGRABitmap.Create(W, H);
           FloatArrayToBitmap(Canvas, CanvasBmp);
-          FileName := Format('frame_%04d.png', [PolygonsCommitted]);
-          CanvasBmp.SaveToFile(FileName);
+          FileName := Format('%s_%.4d.png', [ExtractFileName(ImagePath), PolygonsCommitted]);
+          CanvasBmp.SaveToFile(ExtractFilePath(OutputPath) + FileName);
           CanvasBmp.Free;
         end;
       end
@@ -692,7 +710,7 @@ type
 
 var
   ImagePath: string = 'photo.jpg';
-  OutputPath: string = 'result.png';
+  OutputPath: string = 'output/result.png';
   MaxSize: integer = 256;
   MaxFailures: integer = 20;   // Replaced NPolygons
   NSteps: integer = 2000;
@@ -709,12 +727,21 @@ begin
   if ParamCount >= 5 then NSteps := StrToIntDef(ParamStr(5), NSteps);
   if ParamCount >= 6 then SaveEvery := StrToIntDef(ParamStr(6), SaveEvery);
 
+  // Expand ~ to user's home directory
+  ImagePath := ExpandTilde(ImagePath);
+  OutputPath := ExpandTilde(OutputPath);
+
   if not FileExists(ImagePath) then
   begin
     WriteLn('Usage: PolygonReconstruct <input.jpg> <output.png> [max_size] [max_failure] [n_steps] [save_every]');
     WriteLn('Error: Input file "', ImagePath, '" not found.');
     Exit;
   end;
-
+  WriteLn;
+  WriteLn('Parameters overview');
+  WriteLn('Max consecutive non-improvement = ',MaxFailures);
+  WriteLn('Steps in simulated annealing    = ',NSteps);
+  WriteLn(format('Threshold for non-improvement   = %.2f',[Meaningful_Eps]));
+  WriteLn('---');
   RunReconstruction(ImagePath, OutputPath, MaxSize, MaxFailures, NSteps, Alpha, SaveEvery);
 end.
