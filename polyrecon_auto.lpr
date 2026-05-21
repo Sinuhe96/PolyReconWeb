@@ -1,6 +1,6 @@
 program polyrecon_auto;
 
-{$mode objfpc}{$H+}
+{$mode Delphi}{$H+}
 
 uses
   {$IFDEF UNIX}
@@ -11,7 +11,8 @@ uses
   SysUtils,
   Math,
   BGRABitmap,
-  BGRABitmapTypes;
+  BGRABitmapTypes,
+  Utilities;
 
 type
   TFloatColor = record
@@ -43,6 +44,33 @@ type
     N_steps: integer;
   end;
 
+  // ── Thread Pool Worker ───────────────────────────────────────────────────────
+
+  PFloatColorArray = ^TFloatColorArray;
+
+  TFitWorker = class(TThread)
+  private
+    FStartEvent: PRTLEvent;
+    FDoneEvent: PRTLEvent;
+    FShutdown: boolean;
+
+    // Task parameters
+    FCanvas, FTarget: PFloatColorArray;
+    FSched: TAnnealingSchedule;
+    FH, FW: integer;
+    FAlpha: single;
+
+    // Result
+    FBestPoly: TRasterizedPolygon;
+  protected
+    procedure Execute; override;
+  public
+    constructor Create;
+    destructor Destroy; override;
+    procedure RunTask(ACanvas, ATarget: PFloatColorArray; const ASched: TAnnealingSchedule; AH, AW: integer; AAlpha: single);
+    function GetResult: TRasterizedPolygon;
+  end;
+
   // ── Utils ────────────────────────────────────────────────────────────────────
 
   // Expand ~ to user's home directory (Windows)
@@ -57,7 +85,7 @@ type
       if HomeDir <> '' then
         Result := HomeDir + Copy(Path, 2, MaxInt)
       else
-        Result := Path  // Fallback if env var not found
+        Result := Path;  // Fallback if env var not found
     end
     else
       Result := Path;
@@ -497,7 +525,15 @@ type
     Scale: double;
   begin
     Img := TBGRABitmap.Create(Path);
-    Scale := MaxSize / Max(Img.Height, Img.Width);
+    if MaxSize = 0 then
+      Scale := 1
+    else
+      Scale := MaxSize / Max(Img.Height, Img.Width);
+    if Scale > 1 then begin
+      Writeln('WARNING: given max-size is larger than the target image size. Reset scale to 1');
+      Scale := 1;
+    end;
+
     W := Round(Img.Width * Scale);
     H := Round(Img.Height * Scale);
 
@@ -588,6 +624,67 @@ type
     end;
   end;
 
+  // ── TFitWorker Implementation ─────────────────────────────────────────────────
+
+  constructor TFitWorker.Create;
+  begin
+    inherited Create(False);
+    FStartEvent := RTLEventCreate;
+    FDoneEvent := RTLEventCreate;
+    FShutdown := False;
+  end;
+
+  destructor TFitWorker.Destroy;
+  begin
+    FShutdown := True;
+    RTLEventSetEvent(FStartEvent);
+    WaitFor;
+    RTLEventDestroy(FStartEvent);
+    RTLEventDestroy(FDoneEvent);
+    inherited Destroy;
+  end;
+
+  procedure TFitWorker.RunTask(ACanvas, ATarget: PFloatColorArray; const ASched: TAnnealingSchedule;
+    AH, AW: integer; AAlpha: single);
+  begin
+    FCanvas := ACanvas;
+    FTarget := ATarget;
+    FSched := ASched;
+    FH := AH;
+    FW := AW;
+    FAlpha := AAlpha;
+
+    RTLEventResetEvent(FDoneEvent); // Clear any previous done states
+    RTLEventSetEvent(FStartEvent);  // Wake up the worker
+  end;
+
+  function TFitWorker.GetResult: TRasterizedPolygon;
+  begin
+    RTLEventWaitFor(FDoneEvent);
+    RTLEventResetEvent(FDoneEvent);
+    Result := FBestPoly;
+  end;
+
+  procedure TFitWorker.Execute;
+  begin
+    // CRITICAL: FreePascal's Random generator uses thread-local states.
+    // We MUST seed it uniquely for every new thread!
+    Randomize;
+
+    while not Terminated do
+    begin
+      RTLEventWaitFor(FStartEvent);
+      RTLEventResetEvent(FStartEvent);
+
+      if FShutdown then Break;
+
+      // Run the full 2000-step independent simulated annealing
+      FBestPoly := FitPolygon(FCanvas^, FTarget^, FSched, FH, FW, FAlpha);
+
+      RTLEventSetEvent(FDoneEvent);
+    end;
+  end;
+
   // ── Main Controller ──────────────────────────────────────────────────────────
   procedure confine(var aValue: double; min: double = 0.0; max: double = 1.0);
   begin
@@ -595,8 +692,9 @@ type
     else if aValue > max then aValue := max;
   end;
 
-  const
-    Meaningful_Eps = -0.1;
+const
+  Meaningful_Eps = -0.1;
+  DefaultThreadCount = 4; // Settable constant for thread pool size
 
   procedure RunReconstruction(const ImagePath, OutputPath: string; MaxSize, MaxFailures, NSteps: integer;
     Alpha: single; SaveEvery: integer);
@@ -608,6 +706,16 @@ type
     TInit, InitialScore, CurrentScore, Progress: double;
     rpoly: TRasterizedPolygon;
     FileName: string;
+
+    // -- NEW THREAD VARIABLES --
+    Workers: array of TFitWorker;
+    ThreadCount, threadIdx: integer;
+    BestRPoly, cand_rpoly: TRasterizedPolygon;
+    // --------------------------
+
+    // array to make stats about the worker result
+    result_delta : TArray<single>;
+    result_stats : TStatsResult;
 
     function LinearProgress: double;
     begin
@@ -621,7 +729,7 @@ type
       // Calculate progress based on a logarithmic error curve.
       // We assume a highly detailed reconstruction drops the error to ~1% of the initial error.
       if CurrentScore > 0 then
-        Result := - Ln(CurrentScore / InitialScore) / 4.60517 // 4.60517 is -Ln(0.01)
+        Result := -Ln(CurrentScore / InitialScore) / 4.60517 // 4.60517 is -Ln(0.01)
       else
         Result := 1.0;
 
@@ -652,6 +760,18 @@ type
     BaseSched.Sigma_final := 0.005;
     BaseSched.N_steps := NSteps;
 
+    // -- INITIALIZE THREAD POOL --
+    ThreadCount := StrToIntDef(GetEnvironmentVariable('NUMBER_OF_PROCESSORS'), DefaultThreadCount);
+    if ThreadCount < 1 then ThreadCount := DefaultThreadCount;
+    WriteLn('Spawning ', ThreadCount, ' parallel worker threads...');
+
+    SetLength(Workers, ThreadCount);
+    for threadIdx := 0 to ThreadCount - 1 do
+      Workers[threadIdx] := TFitWorker.Create;
+    // ----------------------------
+    result_delta := nil;
+    SetLength(result_delta,ThreadCount);
+
     PolygonsCommitted := 0;
     Iteration := 0;
     FailCount := 0;
@@ -663,11 +783,26 @@ type
       Inc(Iteration);
 
       Progress := LogProgress();
-
       Sched := AdaptiveSchedule(BaseSched, Progress);
-
       Alpha := 0.75 * (1.0 - 0.8 * Progress);
-      rpoly := FitPolygon(Canvas, Target, Sched, H, W, Alpha);
+
+      // 1. DISPATCH work to all threads simultaneously
+      for threadIdx := 0 to ThreadCount - 1 do
+        Workers[threadIdx].RunTask(@Canvas, @Target, Sched, H, W, Alpha);
+
+      // 2. WAIT and collect the absolute best polygon
+      BestRPoly := Workers[0].GetResult;
+      result_delta[0] := BestRPoly.delta;
+      for threadIdx := 1 to ThreadCount - 1 do
+      begin
+        cand_rpoly := Workers[threadIdx].GetResult;
+        result_delta[threadIdx] := cand_rpoly.delta;
+        if cand_rpoly.delta < BestRPoly.delta then
+          BestRPoly := cand_rpoly;
+      end;
+
+      rpoly := BestRPoly;
+      result_stats := GetStats(result_delta, true);
 
       // Only accept if it actually improves the score by a meaningful margin
       if rpoly.delta < Meaningful_Eps then
@@ -695,6 +830,9 @@ type
         Inc(FailCount);
         WriteLn(Format('Iteration %4d | No improvement. Strike %d/%d', [Iteration, FailCount, MaxFailures]));
       end;
+
+      with result_stats do
+        Writeln(format('  Results min: %.2f max:%.2f band:%.2f mean:%.2f stdDev:%.4f',[min,max,max-min,mean,sigma]));
     end;
 
     CanvasBmp := TBGRABitmap.Create(W, H);
@@ -702,6 +840,12 @@ type
     CanvasBmp.SaveToFile(OutputPath);
     CanvasBmp.Free;
     TargetBmp.Free;
+
+    // -- CLEANUP THREADS --
+    for threadIdx := 0 to ThreadCount - 1 do
+      Workers[threadIdx].Free;
+
+    result_delta := nil;
 
     WriteLn('Finished! Saved -> ', OutputPath);
   end;
@@ -739,9 +883,9 @@ begin
   end;
   WriteLn;
   WriteLn('Parameters overview');
-  WriteLn('Max consecutive non-improvement = ',MaxFailures);
-  WriteLn('Steps in simulated annealing    = ',NSteps);
-  WriteLn(format('Threshold for non-improvement   = %.2f',[Meaningful_Eps]));
+  WriteLn('Max consecutive non-improvement = ', MaxFailures);
+  WriteLn('Steps in simulated annealing    = ', NSteps);
+  WriteLn(format('Threshold for non-improvement   = %.2f', [Meaningful_Eps]));
   WriteLn('---');
   RunReconstruction(ImagePath, OutputPath, MaxSize, MaxFailures, NSteps, Alpha, SaveEvery);
 end.

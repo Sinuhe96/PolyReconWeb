@@ -43,6 +43,33 @@ type
     N_steps: integer;
   end;
 
+  // ── Thread Pool Worker ───────────────────────────────────────────────────────
+
+  PFloatColorArray = ^TFloatColorArray;
+
+  TFitWorker = class(TThread)
+  private
+    FStartEvent: PRTLEvent;
+    FDoneEvent: PRTLEvent;
+    FShutdown: boolean;
+
+    // Task parameters
+    FCanvas, FTarget: PFloatColorArray;
+    FSched: TAnnealingSchedule;
+    FH, FW: integer;
+    FAlpha: single;
+
+    // Result
+    FBestPoly: TRasterizedPolygon;
+  protected
+    procedure Execute; override;
+  public
+    constructor Create;
+    destructor Destroy; override;
+    procedure RunTask(ACanvas, ATarget: PFloatColorArray; const ASched: TAnnealingSchedule; AH, AW: integer; AAlpha: single);
+    function GetResult: TRasterizedPolygon;
+  end;
+
   // ── Utils ────────────────────────────────────────────────────────────────────
 
   // Expand ~ to user's home directory (Windows)
@@ -82,8 +109,7 @@ type
     y_max := Max(verts[0].y, Max(verts[1].y, verts[2].y));
   end;
 
-  procedure ToPixelRange(x_min, x_max, y_min, y_max: double; H, W: integer;
-    out xi_min, xi_max, yi_min, yi_max: integer);
+  procedure ToPixelRange(x_min, x_max, y_min, y_max: double; H, W: integer; out xi_min, xi_max, yi_min, yi_max: integer);
   begin
     xi_min := Max(0, Floor(x_min * W));
     xi_max := Min(W - 1, Ceil(x_max * W));
@@ -503,7 +529,15 @@ type
     Scale: double;
   begin
     Img := TBGRABitmap.Create(Path);
-    Scale := MaxSize / Max(Img.Height, Img.Width);
+    if MaxSize = 0 then
+      Scale := 1
+    else
+      Scale := MaxSize / Max(Img.Height, Img.Width);
+    if Scale > 1 then begin
+      Writeln('WARNING: given max-size is larger than the target image size. Reset scale to 1');
+      Scale := 1;
+    end;
+    
     W := Round(Img.Width * Scale);
     H := Round(Img.Height * Scale);
 
@@ -594,7 +628,73 @@ type
     end;
   end;
 
+  // ── TFitWorker Implementation ─────────────────────────────────────────────────
+
+  constructor TFitWorker.Create;
+  begin
+    inherited Create(False);
+    FStartEvent := RTLEventCreate;
+    FDoneEvent := RTLEventCreate;
+    FShutdown := False;
+  end;
+
+  destructor TFitWorker.Destroy;
+  begin
+    FShutdown := True;
+    RTLEventSetEvent(FStartEvent);
+    WaitFor;
+    RTLEventDestroy(FStartEvent);
+    RTLEventDestroy(FDoneEvent);
+    inherited Destroy;
+  end;
+
+  procedure TFitWorker.RunTask(ACanvas, ATarget: PFloatColorArray; const ASched: TAnnealingSchedule;
+    AH, AW: integer; AAlpha: single);
+  begin
+    FCanvas := ACanvas;
+    FTarget := ATarget;
+    FSched := ASched;
+    FH := AH;
+    FW := AW;
+    FAlpha := AAlpha;
+
+    RTLEventResetEvent(FDoneEvent); // Clear any previous done states
+    RTLEventSetEvent(FStartEvent);  // Wake up the worker
+  end;
+
+  function TFitWorker.GetResult: TRasterizedPolygon;
+  begin
+    RTLEventWaitFor(FDoneEvent);
+    RTLEventResetEvent(FDoneEvent);
+    Result := FBestPoly;
+  end;
+
+  procedure TFitWorker.Execute;
+  begin
+    // CRITICAL: FreePascal's Random generator uses thread-local states.
+    // We MUST seed it uniquely for every new thread!
+    Randomize;
+
+    while not Terminated do
+    begin
+      RTLEventWaitFor(FStartEvent);
+      RTLEventResetEvent(FStartEvent);
+
+      if FShutdown then Break;
+
+      // Run the full 2000-step independent simulated annealing
+      FBestPoly := FitPolygon(FCanvas^, FTarget^, FSched, FH, FW, FAlpha);
+
+      RTLEventSetEvent(FDoneEvent);
+    end;
+  end;
+
+
   // ── Main Controller ──────────────────────────────────────────────────────────
+
+const
+  Meaningful_Eps = -0.1;
+  DefaultThreadCount = 4; // Settable constant for thread pool size
 
   procedure RunReconstruction(const ImagePath, OutputPath: string; MaxSize, NPolygons, NSteps: integer;
     Alpha: single; SaveEvery: integer);
@@ -606,6 +706,12 @@ type
     TInit, CurrentScore: double;
     rpoly: TRasterizedPolygon;
     FileName: string;
+
+    // -- NEW THREAD VARIABLES --
+    Workers: array of TFitWorker;
+    ThreadCount, threadIdx: integer;
+    BestRPoly, cand_rpoly: TRasterizedPolygon;
+    // --------------------------
   begin
     WriteLn('Loading image: ', ImagePath);
     TargetBmp := LoadAndScale(ImagePath, MaxSize, W, H);
@@ -627,12 +733,37 @@ type
     BaseSched.Sigma_final := 0.005;
     BaseSched.N_steps := NSteps;
 
+    // -- INITIALIZE THREAD POOL --
+    ThreadCount := StrToIntDef(GetEnvironmentVariable('NUMBER_OF_PROCESSORS'), DefaultThreadCount);
+    if ThreadCount < 1 then ThreadCount := DefaultThreadCount;
+    WriteLn('Spawning ', ThreadCount, ' parallel worker threads...');
+
+    SetLength(Workers, ThreadCount);
+    for threadIdx := 0 to ThreadCount - 1 do
+      Workers[threadIdx] := TFitWorker.Create;
+    // ----------------------------
+
+
     PolygonsCommitted := 0;
 
     for i := 1 to NPolygons do
     begin
       Sched := AdaptiveSchedule(BaseSched, i, NPolygons);
-      rpoly := FitPolygon(Canvas, Target, Sched, H, W, Alpha);
+
+      // 1. DISPATCH work to all threads simultaneously
+      for threadIdx := 0 to ThreadCount - 1 do
+        Workers[threadIdx].RunTask(@Canvas, @Target, Sched, H, W, Alpha);
+
+      // 2. WAIT and collect the absolute best polygon
+      BestRPoly := Workers[0].GetResult;
+      for threadIdx := 1 to ThreadCount - 1 do
+      begin
+        cand_rpoly := Workers[threadIdx].GetResult;
+        if cand_rpoly.delta < BestRPoly.delta then
+          BestRPoly := cand_rpoly;
+      end;
+
+      rpoly := BestRPoly;
 
       if rpoly.delta < 0.0 then
       begin
@@ -641,13 +772,13 @@ type
       end;
 
       CurrentScore := TotalScore(Canvas, Target);
-      WriteLn(Format('Polygon %4d | score: %.6f | polygons committed: %d', [i, CurrentScore, PolygonsCommitted]));
+      WriteLn(Format('Polygon %4d | score: %.2f | polygons committed: %d/%d', [i, CurrentScore, PolygonsCommitted, NPolygons]));
 
       if (SaveEvery > 0) and (i mod SaveEvery = 0) then
       begin
         CanvasBmp := TBGRABitmap.Create(W, H);
         FloatArrayToBitmap(Canvas, CanvasBmp);
-        FileName := Format('frame_%.4d.png', [i]);
+        FileName := Format('%s_%.4d.png', [ExtractFileName(ImagePath), i]);
         CanvasBmp.SaveToFile(ExtractFilePath(OutputPath) + FileName);
         CanvasBmp.Free;
       end;
@@ -659,14 +790,18 @@ type
     CanvasBmp.Free;
     TargetBmp.Free;
 
-    WriteLn('Saved -> ', OutputPath);
+    // -- CLEANUP THREADS --
+    for threadIdx := 0 to ThreadCount - 1 do
+      Workers[threadIdx].Free;
+
+    WriteLn('Finished! Saved -> ', OutputPath);
   end;
 
   // ── Entry Point ──────────────────────────────────────────────────────────────
 
 var
   ImagePath: string = 'photo.jpg';
-  OutputPath: string = 'result.png';
+  OutputPath: string = 'output/result.png';
   MaxSize: integer = 256;
   NPolygons: integer = 300;
   NSteps: integer = 2000;
@@ -682,15 +817,16 @@ begin
   if ParamCount >= 4 then NPolygons := StrToIntDef(ParamStr(4), NPolygons);
   if ParamCount >= 5 then NSteps := StrToIntDef(ParamStr(5), NSteps);
   if ParamCount >= 6 then SaveEvery := StrToIntDef(ParamStr(6), 0);
-  
+
   // Expand ~ to user's home directory
   ImagePath := ExpandTilde(ImagePath);
   OutputPath := ExpandTilde(OutputPath);
 
-  if not FileExists(ImagePath) then
+  if not FileExists(ImagePath) or not DirectoryExists(ExtractFilePath(OutputPath)) then
   begin
     WriteLn('Usage: PolygonReconstruct <input.jpg> <output.png> [max_size] [n_polygons] [n_steps] [save_every]');
-    WriteLn('Error: Input file "', ImagePath, '" not found.');
+    if not FileExists(ImagePath) then WriteLn('Error: Input file "', ImagePath, '" not found.')
+    else WriteLn('Error: Output path "', ExtractFilePath(OutputPath), '" does not exist.');
     Exit;
   end;
 
