@@ -1,0 +1,290 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Poly-Gisa Image Reconstruct</title>
+    <link rel="icon" type="image/x-icon" href="poly-gisa.logo.png">
+    
+    <!-- Using Google Fonts for a polished, minimalist typography -->
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600&display=swap" rel="stylesheet">
+    
+    <!-- Load the compiled Pascal code -->
+    <script src="PolygonWeb.js"></script>
+
+    <style>
+        :root {
+            /* --bg-color: #f7f9fa; */
+            --bg-color: #fcfaed;
+            --surface-color: #ffffff;
+            --text-main: #1f2937;
+            --text-muted: #6b7280;
+            --border-color: #e5e7eb;
+            --accent-color: #3b82f6;
+            --danger-color: #ef4444;
+            --danger-hover: #dc2626;
+            --radius: 8px;
+        }
+
+        body {
+            font-family: 'Inter', -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+            background-color: var(--bg-color);
+            color: var(--text-main);
+            margin: 0;
+            padding: 0;
+            display: flex;
+            flex-direction: column;
+            min-height: 100vh;
+        }
+
+        /* Main Container */
+        .container {
+            max-width: 900px;
+            margin: 0 auto;
+            padding: 2rem;
+            flex: 1;
+            display: flex;
+            flex-direction: column;
+            gap: 2rem;
+        }
+
+        /* Header Section */
+        header {
+            border-bottom: 1px solid var(--border-color);
+            padding-bottom: 1.5rem;
+        }
+        
+        header h1 {
+            margin: 0 0 0.5rem 0;
+            font-size: 2rem;
+            font-weight: 600;
+            letter-spacing: -0.5px;
+        }
+
+        header p {
+            margin: 0;
+            color: var(--text-muted);
+            line-height: 1.5;
+            font-size: 1rem;
+        }
+
+        /* Upload Section */
+        .upload-section {
+            display: flex;
+            flex-direction: column;
+            gap: 0.5rem;
+        }
+
+        .upload-section label {
+            font-weight: 500;
+            font-size: 0.95rem;
+        }
+
+        input[type="file"] {
+            font-family: inherit;
+            padding: 0.5rem;
+            background: var(--surface-color);
+            border: 1px solid var(--border-color);
+            border-radius: var(--radius);
+            cursor: pointer;
+        }
+
+        /* Canvases & Status */
+        .workspace {
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            gap: 1rem;
+        }
+
+        .canvas-grid {
+            display: flex;
+            gap: 20px;
+            width: 100%;
+            justify-content: center;
+            flex-wrap: wrap;
+        }
+
+        canvas {
+            background-color: var(--surface-color);
+            border: 1px solid var(--border-color);
+            border-radius: var(--radius);
+            box-shadow: 0 2px 4px rgba(0,0,0,0.02);
+            width: 100%;
+            max-width: 420px;
+            aspect-ratio: 1;
+            object-fit: contain;
+        }
+
+        #statusText {
+            font-size: 0.9rem;
+            color: var(--text-muted);
+            font-weight: 500;
+            margin: 0;
+            background: var(--surface-color);
+            padding: 0.5rem 1rem;
+            border-radius: 20px;
+            border: 1px solid var(--border-color);
+        }
+
+        /* Preferences Box */
+        .preferences-box {
+            background: var(--surface-color);
+            border: 1px solid var(--border-color);
+            border-radius: var(--radius);
+            padding: 1.5rem 2rem;
+            box-shadow: 0 4px 6px -1px rgba(0, 0, 0, 0.03);
+            display: flex;
+            flex-direction: column;
+            gap: 1.5rem;
+        }
+
+        .preferences-box h3 {
+            margin: 0;
+            font-size: 1.1rem;
+            font-weight: 600;
+            color: var(--text-main);
+        }
+
+        .pref-row {
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            gap: 1rem;
+            flex-wrap: wrap;
+        }
+
+        .pref-row label {
+            flex: 1;
+            min-width: 250px;
+            font-size: 0.95rem;
+            font-weight: 500;
+            cursor: help; /* Indicates hover hint */
+        }
+
+        .pref-row input[type="range"] {
+            flex: 2;
+            cursor: pointer;
+        }
+
+        .pref-value {
+            width: 50px;
+            text-align: right;
+            font-family: monospace;
+            font-size: 0.95rem;
+            color: var(--text-muted);
+        }
+
+        /* Stop Button */
+        .actions {
+            display: flex;
+            justify-content: flex-end;
+            margin-top: 0.5rem;
+            padding-top: 1rem;
+            border-top: 1px solid var(--border-color);
+        }
+
+        .btn-stop {
+            background-color: var(--danger-color);
+            color: white;
+            border: none;
+            padding: 0.6rem 1.5rem;
+            border-radius: 6px;
+            font-size: 0.9rem;
+            font-weight: 600;
+            cursor: pointer;
+            transition: background-color 0.2s ease;
+        }
+
+        .btn-stop:hover {
+            background-color: var(--danger-hover);
+        }
+
+        /* Footer */
+        footer {
+            background: var(--surface-color);
+            border-top: 1px solid var(--border-color);
+            padding: 1rem 2rem;
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            font-size: 0.8rem;
+            color: var(--text-muted);
+        }
+
+        .footer-version {
+            font-weight: 500;
+        }
+    </style>
+</head>
+<body>
+
+    <div class="container">
+        <!-- Top Section -->
+        <header>
+            <h1>Polygon Image Reconstruct</h1>
+            <img src="poly-gisa.head.png" style="float:left" alt="Poly-Gisa Logo">
+            <p>Upload any image and watch as the algorithm reconstructs it using overlapping semi-transparent polygons. Use the preferences below to fine-tune the generation process in real-time.
+            <br>The reconstruction employs a simulated annealing process with random mutations to find the optimal position for each polygon.</p>
+        </header>
+
+        <!-- Upload Section -->
+        <div class="upload-section">
+            <label for="imageUpload">Select Target Image</label>
+            <input type="file" id="imageUpload" accept="image/*">
+        </div>
+
+        <!-- Canvas Workspace -->
+        <div class="workspace">
+            <div class="canvas-grid">
+                <canvas id="targetCanvas" title="Original Reference Image"></canvas>
+                <canvas id="reconstructCanvas" title="Polygon Reconstruction Output"></canvas>
+            </div>
+            <p id="statusText">Waiting for image...</p>
+            <p id="finalText"></p>
+        </div>
+
+        <!-- Preferences Section -->
+        <div class="preferences-box">
+            <h3>Algorithm Preferences</h3>
+            
+            <div class="pref-row" title="Determines the number of mutation attempts in a single optimization cycle. Higher values take longer but result in finer details.">
+                <label for="annealSteps">Annealing steps</label>
+                <input type="range" id="annealSteps" min="250" max="10000" step="250" value="2000" oninput="document.getElementById('annealStepsVal').innerText = this.value">
+                <span id="annealStepsVal" class="pref-value">2000</span>
+            </div>
+
+            <div class="pref-row" title="The algorithm will stop the current generation pass if it cannot find an improvement after this many consecutive attempts.">
+                <label for="nonImprovementCount">Consecutive non-improvement count</label>
+                <input type="range" id="nonImprovementCount" min="1" max="50" step="1" value="20" oninput="document.getElementById('nonImprovementCountVal').innerText = this.value">
+                <span id="nonImprovementCountVal" class="pref-value">20</span>
+            </div>
+
+            <div class="actions">
+                <button type="button" id="stopBtn" class="btn-stop" title="Immediately halt the rendering process">
+                    Stop Reconstruction
+                </button>
+            </div>
+        </div>
+    </div>
+
+    <!-- Bottom Footer -->
+    <footer>
+        <div class="footer-credit">&copy; 2026 Polygon Reconstruct by VA. All rights reserved.</div>
+        <div class="footer-version">v1.0.2</div>
+    </footer>
+
+    <script>
+        // Start the Pascal application once the page loads
+        window.addEventListener("load", () => {
+            if (typeof rtl !== 'undefined' && rtl.run) {
+                rtl.run();
+            } else {
+                console.warn("rtl.run is not defined. Make sure PolygonWeb.js is loaded correctly.");
+            }
+        });
+    </script>
+</body>
+</html>
