@@ -13,6 +13,9 @@ uses
   BGRABitmap,
   BGRABitmapTypes;
 
+const
+  NUM_VERTICES = 6; // Set to 3 for triangles, 4 for quads, 6 for hexagons, etc.
+
 type
   TFloatColor = record
     r, g, b: single;
@@ -22,7 +25,7 @@ type
   TVertex = record
     x, y: double;
   end;
-  TPolyVertices = array[0..2] of TVertex;
+  TPolyVertices = array[0..NUM_VERTICES-1] of TVertex;
 
   TPolygon = record
     vertices: TPolyVertices;
@@ -102,11 +105,15 @@ type
   end;
 
   procedure BoundingBox(const verts: TPolyVertices; out x_min, x_max, y_min, y_max: double);
+  var i: Integer;
   begin
-    x_min := Min(verts[0].x, Min(verts[1].x, verts[2].x));
-    x_max := Max(verts[0].x, Max(verts[1].x, verts[2].x));
-    y_min := Min(verts[0].y, Min(verts[1].y, verts[2].y));
-    y_max := Max(verts[0].y, Max(verts[1].y, verts[2].y));
+    x_min := verts[0].x; x_max := verts[0].x;
+    y_min := verts[0].y; y_max := verts[0].y;
+    for i := 1 to NUM_VERTICES - 1 do
+    begin
+      x_min := Min(x_min, verts[i].x); x_max := Max(x_max, verts[i].x);
+      y_min := Min(y_min, verts[i].y); y_max := Max(y_max, verts[i].y);
+    end;
   end;
 
   procedure ToPixelRange(x_min, x_max, y_min, y_max: double; H, W: integer; out xi_min, xi_max, yi_min, yi_max: integer);
@@ -122,16 +129,47 @@ type
     Result := (px - bx) * (ay - by) - (ax - bx) * (py - by);
   end;
 
+  procedure SortVertices(var verts: TPolyVertices);
+  var
+    cx, cy: Double;
+    i, j: Integer;
+    tmpVert: TVertex;
+    tmpAngle: Double;
+    angles: array[0..NUM_VERTICES-1] of Double;
+  begin
+    cx := 0; cy := 0;
+    // Find the center (centroid)
+    for i := 0 to NUM_VERTICES - 1 do
+    begin
+      cx := cx + verts[i].x;
+      cy := cy + verts[i].y;
+    end;
+    cx := cx / NUM_VERTICES;
+    cy := cy / NUM_VERTICES;
+
+    // Calculate the angle of each vertex relative to the center
+    for i := 0 to NUM_VERTICES - 1 do
+      angles[i] := ArcTan2(verts[i].y - cy, verts[i].x - cx);
+
+    // Simple Bubble Sort by angle (NUM_VERTICES is small, so this is extremely fast)
+    for i := 0 to NUM_VERTICES - 2 do
+      for j := i + 1 to NUM_VERTICES - 1 do
+        if angles[i] > angles[j] then
+        begin
+          tmpVert := verts[i]; verts[i] := verts[j]; verts[j] := tmpVert;
+          tmpAngle := angles[i]; angles[i] := angles[j]; angles[j] := tmpAngle;
+        end;
+  end;
+
   // ── Rasterizer ───────────────────────────────────────────────────────────────
 
   procedure Rasterize(const poly: TPolygon; H, W: integer; var rpoly: TRasterizedPolygon);
   var
     x_min, x_max, y_min, y_max: double;
-    i, j, idx: integer;
-    px, py: double;
-    d1, d2, d3: double;
-    has_neg, has_pos: boolean;
-    ax, ay, bx, by, cx, cy: double;
+    i, j, k, idx: Integer;
+    px, py, d: Double;
+    has_neg, has_pos: Boolean;
+    vx, vy: array[0..NUM_VERTICES-1] of Double;
   begin
     BoundingBox(poly.vertices, x_min, x_max, y_min, y_max);
     ToPixelRange(x_min, x_max, y_min, y_max, H, W, rpoly.xi_min, rpoly.xi_max, rpoly.yi_min, rpoly.yi_max);
@@ -144,12 +182,12 @@ type
     SetLength(rpoly.mask, rpoly.bh * rpoly.bw);
     if (rpoly.bh = 0) or (rpoly.bw = 0) then Exit;
 
-    ax := poly.vertices[0].x * W;
-    ay := poly.vertices[0].y * H;
-    bx := poly.vertices[1].x * W;
-    by := poly.vertices[1].y * H;
-    cx := poly.vertices[2].x * W;
-    cy := poly.vertices[2].y * H;
+    // Precompute pixel coordinates of vertices
+    for k := 0 to NUM_VERTICES - 1 do
+    begin
+      vx[k] := poly.vertices[k].x * W;
+      vy[k] := poly.vertices[k].y * H;
+    end;
 
     idx := 0;
     for i := 0 to rpoly.bh - 1 do
@@ -158,14 +196,20 @@ type
       for j := 0 to rpoly.bw - 1 do
       begin
         px := rpoly.xi_min + j + 0.5;
+        
+        has_neg := False;
+        has_pos := False;
 
-        d1 := EdgeFn(ax, ay, bx, by, px, py);
-        d2 := EdgeFn(bx, by, cx, cy, px, py);
-        d3 := EdgeFn(cx, cy, ax, ay, px, py);
-
-        has_neg := (d1 < 0) or (d2 < 0) or (d3 < 0);
-        has_pos := (d1 > 0) or (d2 > 0) or (d3 > 0);
-
+        // Check all edges
+        for k := 0 to NUM_VERTICES - 1 do
+        begin
+          d := EdgeFn(vx[k], vy[k], vx[(k+1) mod NUM_VERTICES], vy[(k+1) mod NUM_VERTICES], px, py);
+          if d < 0 then has_neg := True else if d > 0 then has_pos := True;
+          
+          // Optimization: if it's on both sides of different edges, it's outside. Stop checking.
+          if has_neg and has_pos then Break;
+        end;
+        
         rpoly.mask[idx] := not (has_neg and has_pos);
         Inc(idx);
       end;
@@ -284,7 +328,7 @@ type
       TotalError := TotalError + ErrorMap[i];
     end;
 
-    for k := 0 to 2 do
+    for k := 0 to NUM_VERTICES - 1 do
     begin
       RndVal := Random * TotalError;
       Acc := 0.0;
@@ -302,6 +346,7 @@ type
       end;
     end;
 
+    SortVertices(verts);
     poly.vertices := verts;
     poly.color.r := 0.5;
     poly.color.g := 0.5;
@@ -327,7 +372,7 @@ type
 
     if r < 0.50 then
     begin
-      i := Random(3);
+      i := Random(NUM_VERTICES);
       Result[i].x := Result[i].x + Randn * Sigma;
       Result[i].y := Result[i].y + Randn * Sigma;
     end
@@ -335,7 +380,7 @@ type
     begin
       dx := Randn * Sigma;
       dy := Randn * Sigma;
-      for i := 0 to 2 do
+      for i := 0 to NUM_VERTICES - 1 do
       begin
         Result[i].x := Result[i].x + dx;
         Result[i].y := Result[i].y + dy;
@@ -343,10 +388,18 @@ type
     end
     else if r < 0.875 then
     begin
-      centroid.x := (Result[0].x + Result[1].x + Result[2].x) / 3.0;
-      centroid.y := (Result[0].y + Result[1].y + Result[2].y) / 3.0;
+      centroid.x := 0.0;
+      centroid.y := 0.0;
+      for i := 0 to NUM_VERTICES - 1 do
+      begin
+        centroid.x := centroid.x + Result[i].x;
+        centroid.y := centroid.y + Result[i].y;
+      end;
+      centroid.x := centroid.x / NUM_VERTICES;
+      centroid.y := centroid.y / NUM_VERTICES;
+      
       ScaleFactor := 1.0 + Randn * Sigma;
-      for i := 0 to 2 do
+      for i := 0 to NUM_VERTICES - 1 do
       begin
         Result[i].x := centroid.x + (Result[i].x - centroid.x) * ScaleFactor;
         Result[i].y := centroid.y + (Result[i].y - centroid.y) * ScaleFactor;
@@ -354,12 +407,20 @@ type
     end
     else
     begin
-      centroid.x := (Result[0].x + Result[1].x + Result[2].x) / 3.0;
-      centroid.y := (Result[0].y + Result[1].y + Result[2].y) / 3.0;
+      centroid.x := 0.0;
+      centroid.y := 0.0;
+      for i := 0 to NUM_VERTICES - 1 do
+      begin
+        centroid.x := centroid.x + Result[i].x;
+        centroid.y := centroid.y + Result[i].y;
+      end;
+      centroid.x := centroid.x / NUM_VERTICES;
+      centroid.y := centroid.y / NUM_VERTICES;
+      
       Theta := Randn * Sigma * Pi;
       C := Cos(Theta);
       S := Sin(Theta);
-      for i := 0 to 2 do
+      for i := 0 to NUM_VERTICES - 1 do
       begin
         dx := Result[i].x - centroid.x;
         dy := Result[i].y - centroid.y;
@@ -368,13 +429,15 @@ type
       end;
     end;
 
-    for i := 0 to 2 do
+    for i := 0 to NUM_VERTICES - 1 do
     begin
       if Result[i].x < 0.0 then Result[i].x := 0.0
       else if Result[i].x > 1.0 then Result[i].x := 1.0;
       if Result[i].y < 0.0 then Result[i].y := 0.0
       else if Result[i].y > 1.0 then Result[i].y := 1.0;
     end;
+    
+    SortVertices(Result);
   end;
 
   // ── Annealing Schedule ───────────────────────────────────────────────────────
